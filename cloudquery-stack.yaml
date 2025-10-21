@@ -1,0 +1,134 @@
+# 1) Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloud-query
+
+---
+
+# 2) Configs for CloudQuery sources & destinations
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudquery-config
+  namespace: cloud-query
+data:
+  destination.mysql.yml: |
+    kind: destination
+    spec:
+      name: "mysql"
+      path: "cloudquery/mysql"
+      registry: "cloudquery"
+      version: "v5.5.3"
+      send_sync_summary: true
+      spec:
+        connection_string: "${DB_DSN}"
+
+  source.k8s.yml: |
+    kind: source
+    spec:
+      name: "k8s"
+      path: "cloudquery/k8s"
+      registry: "cloudquery"
+      version: "v7.9.12"
+      tables: ["*"]
+      destinations: ["mysql"]
+      spec:
+        concurrency: 2000
+
+---
+
+# 3) RBAC & ServiceAccount scoped to namespace, cluster-read
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudquery-sa
+  namespace: cloud-query
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cloudquery-cluster-read
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get","list"]
+- nonResourceURLs: ["*"]
+  verbs: ["get","list"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cloudquery-cluster-read-binding
+subjects:
+- kind: ServiceAccount
+  name: cloudquery-sa
+  namespace: cloud-query
+roleRef:
+  kind: ClusterRole
+  name: cloudquery-cluster-read
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+# 4) CronJob (periodic syncs), isolated in cloud-query ns
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cloudquery-k8s-to-mysql
+  namespace: cloud-query
+spec:
+  schedule: "*/30 * * * *"        # every 30 minutes
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: cloudquery-sa
+          restartPolicy: Never
+          # if using a private Docker Hub repo:
+          # imagePullSecrets:
+          # - name: dh-pull
+          containers:
+          - name: cloudquery
+            image: to_be_replaced_by_deploy_script
+            imagePullPolicy: IfNotPresent
+
+            env:
+            - name: DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudquery-secrets
+                  key: DB_DSN
+
+            - name: CLOUDQUERY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cloudquery-secrets
+                  key: CLOUDQUERY_API_KEY
+
+            command: ["cloudquery"]
+            args: ["sync", "/config"]
+            volumeMounts:
+            - name: cfg
+              mountPath: /config
+            resources:
+              requests:
+                cpu: "200m"
+                memory: "256Mi"
+              limits:
+                cpu: "1"
+                memory: "1Gi"
+          volumes:
+          - name: cfg
+            configMap:
+              name: cloudquery-config
